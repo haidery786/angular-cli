@@ -17,13 +17,21 @@ var_1: &default_docker_image circleci/node:10.12
 var_2: &browsers_docker_image circleci/node:10.12-browsers
 var_3: &browsers_docker_image_node_12 circleci/node:12.1-browsers
 var_4: &cache_key angular_devkit-0.10.0-{{ checksum "yarn.lock" }}
+var_5: &cache_key_win angular_devkit-win-0.10.0-{{ checksum "yarn.lock" }}
 
 # Settings common to each job
 anchor_1: &defaults
   working_directory: ~/ng
   docker:
     - image: *default_docker_image
+anchor_1_win: &defaults_win
+  working_directory: ~/ng
+  resource_class: windows.medium
+  shell: powershell.exe -ExecutionPolicy Bypass
+  machine:
+    image: windows-server-2019  
 
+# TODO: consider rolling some of these into the install step. They are only used there.
 # After checkout, rebase on top of target branch.
 anchor_2: &post_checkout
   run:
@@ -38,18 +46,110 @@ anchor_2: &post_checkout
       else
         echo "This build is not over a PR, nothing to do."
       fi
+# TODO: consider using the same linux script by specifying the bash shell.
+anchor_2_win: &post_checkout_win
+  run:
+    name: Rebase PR on target branch
+    command: >
+      if (Test-Path env:CIRCLE_PR_NUMBER) {
+        git config user.name "angular-ci"
+        git config user.email "angular-ci"
+        node tools\rebase-pr.js angular/angular-cli $env:CIRCLE_PR_NUMBER }
 anchor_3: &restore_cache
   restore_cache:
     keys:
       - *cache_key
       # This fallback should be the cache_key without variables.
-      - angular_devkit-0.7.0-
+      - angular_devkit-0.10.0-
+anchor_3_win: &restore_cache_win
+  restore_cache:
+    keys:
+      - *cache_key_win
+      # This fallback should be the cache_key without variables.
+      - angular_devkit-win-0.10.0-
 anchor_4: &attach_options
   at: .
-
+anchor_5: &windows_env
+  run:
+    # Need to install node and yarn before, as the base windows image doesn't have anything.
+    name: Setup windows node environment
+    command: ./.circleci/windows-env.ps1
+      
 # Job definitions
-version: 2
+version: 2.1
 jobs:
+  # Windows notes:
+  # - tabbing/up/down in ssh sessions doesn't seem to work well.
+  # - see path with `echo $Env:Path`
+  # - cache and workspace operations are 40x slower on windows.
+  # todo:
+  # - figure out why the `should wrap the bootstrap declaration in a DOMContentLoaded event handler`
+  #   test fails, seems to be some spaces before the `});`
+  # - figure out caching, workspace
+  # - add sharded e2e
+  # - port rest of commands in appveyor config
+  install-win:
+    <<: *defaults_win
+    steps:
+      - checkout
+      - *windows_env
+      - *post_checkout_win
+      # Skipping cache and workspace for now because it takes too long.
+      # Restoring cache takes ~7 minutes on windows, but only ~30s on linux: 
+      # - windows https://circleci.com/gh/angular/angular-cli/62436
+      # - linux https://circleci.com/gh/angular/angular-cli/61683      
+      # - *restore_cache_win
+      - run: node --version
+      - run: yarn --version
+      # - run: yarn install --frozen-lockfile
+      # Commands from buid-win and test-win
+      # - run: npm run admin -- build  
+      # - run: npm run test -- --full    
+      # - run: node tests\legacy-cli\run_e2e.js "--glob=tests/{basic,commands,generate,ivy}/**"
+      # Skipping cache and workspace for now because it takes too long.
+      # Persisting to workspace takes ~7 minutes on windows, but only ~40s on linux: 
+      # - windows https://circleci.com/gh/angular/angular-cli/62436
+      # - linux https://circleci.com/gh/angular/angular-cli/61712
+      # - persist_to_workspace:
+      #     root: .
+      #     paths:
+      #       - ./*
+      # Saving cache takes ~7 minutes on windows, but only ~40s on linux: 
+      # - windows https://circleci.com/gh/angular/angular-cli/62436
+      # - linux https://circleci.com/gh/angular/angular-cli/61712          
+      # - save_cache:
+      #     key: *cache_key_win
+      #     paths:
+      #       # Obtained via `yarn cache dir`.
+      #       - C:\Users\circleci\AppData\Local\Yarn\Cache\v4
+
+  build-win:
+    <<: *defaults_win
+    steps:
+      - attach_workspace: *attach_options
+      - *windows_env
+      - run: npm run admin -- build            
+
+  test-win:
+    <<: *defaults_win
+    steps:
+      # Can't use workspace from linux directly, "Error extracting tarball"
+      # Probably due to symlinks in yarn workspaces.
+      # https://circleci.com/gh/angular/angular-cli/61500
+      # Applying workspace takes ~7 minutes on windows, but only ~1m on linux: 
+      # - windows https://circleci.com/gh/angular/angular-cli/62496
+      # - linux https://circleci.com/gh/angular/angular-cli/61767         
+      - attach_workspace: *attach_options
+      - *windows_env
+      - run: npm run test -- --full         
+
+  e2e-cli-win:
+    <<: *defaults_win
+    steps:     
+      - attach_workspace: *attach_options
+      - *windows_env
+      - run: node tests\legacy-cli\run_e2e.js "--glob=tests/{basic,commands,generate,ivy}/**"   
+
   install:
     <<: *defaults
     steps:
@@ -114,7 +214,7 @@ jobs:
       - run: PATH=~/.npm-global/bin:$PATH xvfb-run -a node ./tests/legacy-cli/run_e2e --nb-shards=${CIRCLE_NODE_TOTAL} --shard=${CIRCLE_NODE_INDEX}
       - store_artifacts:
           path: /tmp/dist
-          destination: cli/new-production
+          destination: cli/new-production   
 
   e2e-cli-node-12:
     <<: *defaults
@@ -201,70 +301,75 @@ jobs:
           name: Deployment to NPM
           command: |
             npm run admin -- publish --verbose
+             
 
 workflows:
   version: 2
   default_workflow:
     jobs:
-      - install
-      - lint:
-          requires:
-            - install
-      - validate:
-          requires:
-            - install
-      - build:
-          requires:
-            - install
-          filters:
-            branches:
-              ignore:
-              - /docs-preview/
-      - build-bazel:
-          requires:
-            - build
-      - test:
-          requires:
-            - build
-      - test-large:
-          requires:
-            - build
-      - e2e-cli:
-          requires:
-            - build
-      - e2e-cli-node-12:
-          requires:
-            - build
-      - e2e-cli-ivy:
-          requires:
-            - build            
-      - snapshot_publish_docs:
-          requires:
-          - install
-          filters:
-            branches:
-              only:
-              - /docs-preview/
-      - e2e-cli-ng-snapshots:
-          requires:
-            - build
-      - snapshot_publish:
-          requires:
-            - test
-            - build
-            - e2e-cli
-          filters:
-            branches:
-              ignore:
-                - /pull\/.*/
-      - publish:
-          requires:
-            - test
-            - build
-            - e2e-cli
-            - snapshot_publish
-          filters:
-            tags:
-              only: /^v\d+/
-            branches:
-              ignore: /.*/
+      - install-win
+      # - build-win:
+      #     requires:
+      #       - install-win
+      #     filters:
+      #       branches:
+      #         ignore:
+      #         - /docs-preview/
+      # - test-win:
+      #     requires:
+      #       - build-win
+      # - install
+      # - lint:
+      #     requires:
+      #       - install
+      # - validate:
+      #     requires:
+      #       - install
+      # - build:
+      #     requires:
+      #       - install
+      #     filters:
+      #       branches:
+      #         ignore:
+      #         - /docs-preview/
+      # - build-bazel:
+      #     requires:
+      #       - build
+      # - test:
+      #     requires:
+      #       - build
+      # - test-large:
+      #     requires:
+      #       - build
+      # - e2e-cli:
+      #     requires:
+      #       - build
+      # - e2e-cli-node-12:
+      #     requires:
+      #       - build
+      # - e2e-cli-ivy:
+      #     requires:
+      #       - build            
+      # - e2e-cli-ng-snapshots:
+      #     requires:
+      #       - build
+      # - snapshot_publish:
+      #     requires:
+      #       - test
+      #       - build
+      #       - e2e-cli
+      #     filters:
+      #       branches:
+      #         ignore:
+      #           - /pull\/.*/
+      # - publish:
+      #     requires:
+      #       - test
+      #       - build
+      #       - e2e-cli
+      #       - snapshot_publish
+      #     filters:
+      #       tags:
+      #         only: /^v\d+/
+      #       branches:
+      #         ignore: /.*/
